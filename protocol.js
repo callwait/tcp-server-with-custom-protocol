@@ -8,22 +8,75 @@ const ByteBuffer = require('bytebuffer')
  * Int32 length
  * Uint32Array payload
  * Int32 crc
- * 
+ *
  * returned object { len, buffer, crc }
  */
 class MessageProtocol {
-    toBuffer(arr) {
-        const uintArray = new Uint32Array(arr)
-        const data = uintArray.buffer
-        const len = uintArray.length
+    constructor() {
+        this.ttl = 60 * 1000 // TTL 60 sec
+        this.storageLimit = 5 * 1024 * 1024 // 5 mb - total cache storage size
+        this.storageUsage = 0
+        this.cached = []
+    }
+
+    removeCacheWithDebounce(func, wait, immediate) {
+        let timeout
+        return function() {
+            let context = this,
+                args = arguments
+            clearTimeout(timeout)
+            if (immediate && !timeout) func.apply(context, args)
+            timeout = setTimeout(function() {
+                timeout = null
+                if (!immediate) func.apply(context, args)
+            }, wait)
+        }
+    }
+
+    async memoize(uintArray, fn) {
         const crc = crc32.buf(uintArray)
-        const crcInt32 = new ByteBuffer(4).writeInt32(crc).flip()
-        const lengthInt32 = new ByteBuffer(4).writeInt32(len).flip()
-        const buffer = ByteBuffer.concat([lengthInt32, data, crcInt32]).toBuffer()
-        return {
-            len,
-            buffer,
-            crc
+        let result
+        if (this.cached[crc]) {
+            result = this.cached[crc]
+        } else {
+            result = fn.apply(this, uintArray)
+            this.storageUsage += result.length
+            console.log(this.storageLimit, '---', this.storageUsage)
+            if (this.storageLimit >= this.storageUsage) {
+                this.cached[crc] = result
+                this.removeCacheWithDebounce(() => {
+                    this.storageUsage -= this.cached[crc].length
+                    console.log('New storage used size: ', this.storageUsage)
+
+                    console.log('Deleted cache row: ', crc)
+                    delete this.cached[crc]
+                }, this.ttl)()
+            } else {
+                throw new Error('Storage size is limited')
+            }
+        }
+        return Promise.resolve(result)
+    }
+    toBuffer(arr) {
+        if (Array.isArray(arr)) {
+            const uintArray = new Uint32Array(arr)
+            const fn = function() {
+                const data = uintArray.buffer
+                const len = uintArray.length
+                const crc = crc32.buf(uintArray)
+                const crcInt32 = new ByteBuffer(4).writeInt32(crc).flip()
+                const lengthInt32 = new ByteBuffer(4).writeInt32(len).flip()
+                return ByteBuffer.concat([
+                    lengthInt32,
+                    data,
+                    crcInt32,
+                ]).toBuffer()
+            }
+            return this.memoize(uintArray, fn).then((result) => {
+                return result
+            })
+        } else {
+            return Promise.reject('must be of type: array')
         }
     }
 
@@ -36,27 +89,19 @@ class MessageProtocol {
         const payload = new Uint32Array(payloadArrayBuffer)
         const calculatedCrc = crc32.buf(payload)
         if (crc !== calculatedCrc) {
-            throw new Error('CRC not match: received: ' + crc + '; calculated: ' + calculatedCrc)
+            throw new Error(
+                'CRC not match: received: ' +
+                    crc +
+                    '; calculated: ' +
+                    calculatedCrc
+            )
         }
         return {
             len,
             payload,
-            crc
+            crc,
         }
     }
-
-    memoize(fn) {
-        let mem;
-        return (...args) => {
-          if (mem) {
-            return mem;
-          } else {
-            mem = fn(...args);
-            return mem;
-          }
-        }
-      }
-
 }
 
-module.exports = MessageProtocol;
+module.exports = MessageProtocol
